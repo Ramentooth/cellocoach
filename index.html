@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="CelloCoach">
+<meta name="theme-color" content="#0e0d12">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon.png">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<title>CelloCoach</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<main id="view"></main>
+
+<nav class="tabbar">
+  <button class="tab active" data-tab="practice"><span class="tab-icon">⏱️</span><span>Practice</span></button>
+  <button class="tab" data-tab="chat"><span class="tab-icon">💬</span><span>Coach</span></button>
+  <button class="tab" data-tab="record"><span class="tab-icon">🎙️</span><span>Record</span></button>
+  <button class="tab" data-tab="library"><span class="tab-icon">🎼</span><span>Library</span></button>
+  <button class="tab" data-tab="settings"><span class="tab-icon">⚙️</span><span>Settings</span></button>
+</nav>
+
+<div id="sheet-backdrop" class="sheet-backdrop hidden"></div>
+<div id="sheet" class="sheet hidden"></div>
+<div id="toast" class="toast hidden"></div>
+
+<script src="db.js"></script>
+<script src="scheduler.js"></script>
+<script src="ai.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
