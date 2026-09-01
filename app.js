@@ -12,6 +12,7 @@ const state = {
   conversationId: null,
   libraryMode: 'pieces',
   setupSel: [],
+  setupSpotSel: [],
 };
 
 const RATING_LABELS = ['Again', 'Hard', 'Good', 'Easy'];
@@ -83,9 +84,36 @@ const practice = {
 const PRACTICE_PREFS_KEY = 'cc-practice-prefs';
 const PRACTICE_SESSION_KEY = 'cc-practice-session';
 
+const PREF_DEFAULTS = { totalMin: 30, reps: 2, mode: 'pieces' };
+const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+
+// You set the TOTAL length; block length is derived from it. Saves from the older
+// "minutes per block x rounds" model are converted rather than thrown away — two
+// rounds of 7 minutes was really a ~28-minute session, so that's what it becomes.
 function prefs() {
-  try { return { blockMin: 7, rounds: 2, ...JSON.parse(localStorage.getItem(PRACTICE_PREFS_KEY) || '{}') }; }
-  catch { return { blockMin: 7, rounds: 2 }; }
+  let raw = {};
+  try { raw = JSON.parse(localStorage.getItem(PRACTICE_PREFS_KEY) || '{}') || {}; } catch {}
+  const p = { ...PREF_DEFAULTS, ...raw };
+  if (raw.totalMin == null && Number.isFinite(raw.blockMin) && Number.isFinite(raw.rounds)) {
+    p.totalMin = clamp(raw.blockMin * raw.rounds * 2, 10, 120);
+    p.reps = raw.rounds;
+  }
+  p.totalMin = clamp(Math.round(Number(p.totalMin) || PREF_DEFAULTS.totalMin), 5, 180);
+  p.reps = clamp(Math.round(Number(p.reps) || PREF_DEFAULTS.reps), 1, 6);
+  if (p.mode !== 'spots') p.mode = 'pieces';
+  delete p.blockMin; delete p.rounds;
+  return p;
+}
+
+// Split `totalMin` across `n` blocks in whole seconds, handing the leftover seconds to
+// the earliest blocks. 30 minutes over 4 becomes four 7:30 blocks — not four 7:00 blocks
+// and three minutes quietly lost off the end of the session.
+function splitBlockSecs(totalMin, n) {
+  if (n <= 0) return [];
+  const total = Math.round(totalMin * 60);
+  const base = Math.floor(total / n);
+  const rem = total - base * n;
+  return Array.from({ length: n }, (_, i) => base + (i < rem ? 1 : 0));
 }
 function savePrefs(p) { localStorage.setItem(PRACTICE_PREFS_KEY, JSON.stringify(p)); }
 function saveSession() {
@@ -123,17 +151,70 @@ async function grabWakeLock() {
 
 // ---------- setup screen ----------
 
+// "due 2026-09-01" wraps a narrow row onto a second line and reads slower than the
+// thing you actually want to know, which is whether it's waiting on you right now.
+function dueLabel(dateStr) {
+  const today = DB.today();
+  if (!dateStr) return '';
+  if (dateStr <= today) return dateStr < today ? 'overdue' : 'due today';
+  const days = Math.round((new Date(dateStr + 'T00:00:00') - new Date(today + 'T00:00:00')) / 86400000);
+  return days === 1 ? 'due tomorrow' : `due in ${days}d`;
+}
+
+// Everything the setup screen and startSession() need to agree on: what you picked,
+// how many blocks that becomes, and how long each one runs.
+function sessionPlan() {
+  const pf = prefs();
+  const data = state.data || refreshState();
+  if (pf.mode === 'spots') {
+    const chosen = state.setupSpotSel
+      .map((id) => data.spots.find((sp) => sp.id === id))
+      .filter(Boolean);
+    const order = chosen.map((sp) => ({
+      kind: 'spot', spotId: sp.id, pieceId: sp.piece_id ?? 0,
+      title: sp.name, sub: sp.piece_title || 'Technique',
+    }));
+    return { pf, order, unit: 'spot' };
+  }
+  const titles = new Map([[0, '🛠 Technique'], ...data.pieces.map((p) => [p.id, p.title])]);
+  const order = state.setupSel.map((id) => ({
+    kind: 'piece', pieceId: id, spotId: null,
+    title: titles.get(id) || 'Piece', sub: '',
+  }));
+  return { pf, order, unit: 'piece' };
+}
+
+// One block per pick, the whole set repeated `reps` times. Repeating the set rather
+// than each item keeps the same thing from running back-to-back — the interleaving is
+// the point, so two reps of A,B is A,B,A,B and never A,A,B,B.
+function buildBlocks() {
+  const { pf, order } = sessionPlan();
+  if (!order.length) return [];
+  const blocks = [];
+  for (let r = 0; r < pf.reps; r++) blocks.push(...order.map((o) => ({ ...o })));
+  const secs = splitBlockSecs(pf.totalMin, blocks.length);
+  blocks.forEach((b, i) => { b.secs = secs[i]; });
+  return blocks;
+}
+
+// ---------- setup screen ----------
+
 function renderPractice() {
   if (practice.session) return renderSessionScreen();
   const data = refreshState();
 
   const t = data.today;
+  const pf = prefs();
+  const spotsMode = pf.mode === 'spots';
+
   const groups = [...data.pieces.filter((p) => p.status === 'active').map((p) => ({ id: p.id, title: p.title }))];
   if (data.spots.some((s) => !s.piece_id)) groups.push({ id: 0, title: '🛠 Technique & warm-ups' });
   const dueCount = (id) => Scheduler.spotsForPiece(id).filter((s) => s.due_date <= t).length;
   const strugCount = (id) => Scheduler.spotsForPiece(id).filter((s) => s.status === 'struggling').length;
 
-  if (!state.setupSel.length) {
+  // First visit of the day: pre-pick what needs the work, so the common case is
+  // "set the time, hit start". Only ever seeds an empty selection.
+  if (!spotsMode && !state.setupSel.length) {
     state.setupSel = groups
       .map((g) => ({ id: g.id, score: strugCount(g.id) * 10 + dueCount(g.id) + (Scheduler.spotsForPiece(g.id).length ? 1 : 0) }))
       .sort((a, b) => b.score - a.score)
@@ -141,9 +222,42 @@ function renderPractice() {
       .filter((g) => g.score > 0)
       .map((g) => g.id);
   }
-  const pf = prefs();
-  const sel = state.setupSel;
-  const total = sel.length * pf.rounds * pf.blockMin;
+
+  // Spots mode lists every live spot, hardest and most overdue first, grouped by piece.
+  const allSpots = spotsMode
+    ? [...data.spots.filter((sp) => sp.status !== 'mastered')]
+        .sort((a, b) => Scheduler.spotPriority(b) - Scheduler.spotPriority(a))
+    : [];
+  state.setupSpotSel = state.setupSpotSel.filter((id) => allSpots.some((sp) => sp.id === id));
+
+  const picked = spotsMode ? state.setupSpotSel : state.setupSel;
+  const blocks = buildBlocks();
+  const perBlock = blocks.length ? blocks[0].secs : 0;
+  const thin = blocks.length && perBlock < 90;
+
+  const pickerRows = spotsMode
+    ? (allSpots.map((sp) => {
+        const pos = state.setupSpotSel.indexOf(sp.id);
+        return `<div class="piece-pick ${pos !== -1 ? 'picked' : ''}" data-pickspot="${sp.id}">
+          <span class="pick-num">${pos !== -1 ? pos + 1 : ''}</span>
+          <div class="grow">
+            <div class="title">${esc(sp.name)}</div>
+            <div class="sub"><span class="status-pill ${esc(sp.status)}">${esc(sp.status)}</span> ${esc(sp.piece_title || 'Technique')} · ${esc(dueLabel(sp.due_date))}</div>
+          </div>
+          <button class="pick-dots" data-editspot="${sp.id}" title="Edit spot" aria-label="Edit spot">⋯</button>
+        </div>`;
+      }).join('') || '<p class="muted">No practice spots yet — add one below, or say one into the mic during a session.</p>')
+    : (groups.map((g) => {
+        const pos = state.setupSel.indexOf(g.id);
+        return `<div class="piece-pick ${pos !== -1 ? 'picked' : ''}" data-pick="${g.id}">
+          <span class="pick-num">${pos !== -1 ? pos + 1 : ''}</span>
+          <div class="grow">
+            <div class="title">${esc(g.title)}</div>
+            <div class="sub">${dueCount(g.id)} due${strugCount(g.id) ? ` · <span style="color:var(--red)">${strugCount(g.id)} struggling</span>` : ''}</div>
+          </div>
+          <button class="pick-dots" data-editpiece="${g.id}" title="Edit piece" aria-label="Edit piece">⋯</button>
+        </div>`;
+      }).join('') || '<p class="muted">No songs yet — add one below, or tell the Coach what you\'re working on.</p>');
 
   view.innerHTML = `
     <h1 class="page-title">Practice</h1>
@@ -155,51 +269,89 @@ function renderPractice() {
     </div>
 
     <div class="card">
-      <h3>Pieces this session <span class="muted">(tap to pick, max 3)</span></h3>
-      ${groups.map((g) => {
-        const pos = sel.indexOf(g.id);
-        return `<div class="piece-pick ${pos !== -1 ? 'picked' : ''}" data-pick="${g.id}">
-          <span class="pick-num">${pos !== -1 ? pos + 1 : ''}</span>
-          <div class="grow">
-            <div class="title">${esc(g.title)}</div>
-            <div class="sub">${dueCount(g.id)} due${strugCount(g.id) ? ` · <span style="color:var(--red)">${strugCount(g.id)} struggling</span>` : ''}</div>
-          </div>
-        </div>`;
-      }).join('') || '<p class="muted">Add pieces in Library, or tell the Coach what you\'re working on.</p>'}
+      <h3>How long today?</h3>
+      <div class="row">
+        <div class="grow"><span class="big-num">${pf.totalMin}</span> <span class="muted">minutes</span></div>
+        <div class="stepper"><button data-step="totalMin:-5">−</button><button data-step="totalMin:5">＋</button></div>
+      </div>
+      <div class="quick-mins">
+        ${[15, 20, 30, 45, 60].map((m) => `<button class="chip ${m === pf.totalMin ? 'on' : ''}" data-mins="${m}">${m}</button>`).join('')}
+      </div>
+    </div>
+
+    <div class="seg">
+      <button data-mode="pieces" class="${spotsMode ? '' : 'active'}">Songs</button>
+      <button data-mode="spots" class="${spotsMode ? 'active' : ''}">Spots</button>
     </div>
 
     <div class="card">
-      <h3>Pacing</h3>
       <div class="row" style="margin-bottom:10px">
-        <div class="grow">Minutes per block</div>
-        <div class="stepper"><button data-step="blockMin:-1">−</button><b>${pf.blockMin}</b><button data-step="blockMin:1">＋</button></div>
+        <h3 style="margin:0" class="grow">${spotsMode ? 'Spots to drill' : 'Songs this session'}</h3>
+        <button class="btn small secondary" id="add-item">＋ ${spotsMode ? 'Spot' : 'Song'}</button>
       </div>
+      ${pickerRows}
+    </div>
+
+    <div class="card">
       <div class="row">
-        <div class="grow">Rounds per piece</div>
-        <div class="stepper"><button data-step="rounds:-1">−</button><b>${pf.rounds}</b><button data-step="rounds:1">＋</button></div>
+        <div class="grow">Repetitions of each ${spotsMode ? 'spot' : 'song'}</div>
+        <div class="stepper"><button data-step="reps:-1">−</button><b>${pf.reps}</b><button data-step="reps:1">＋</button></div>
       </div>
     </div>
 
-    <button class="btn" id="start-session" ${!sel.length ? 'disabled' : ''}>▶ Start ${total ? total + '-minute' : ''} session${sel.length ? ` · ${sel.length * pf.rounds} blocks` : ''}</button>
+    ${picked.length ? `<div class="card setup-readout">
+      <div class="ro-main">${blocks.length} block${blocks.length === 1 ? '' : 's'} × ${fmtTime(perBlock)}</div>
+      <div class="muted">${picked.length} ${spotsMode ? 'spot' : 'song'}${picked.length === 1 ? '' : 's'} · ${pf.reps} rep${pf.reps === 1 ? '' : 's'} each · ${pf.totalMin} min total</div>
+      ${thin ? `<div class="warn">Blocks under 1:30 — fewer ${spotsMode ? 'spots' : 'songs'}, fewer reps, or more time would give each one room to land.</div>` : ''}
+    </div>` : ''}
+
+    <button class="btn" id="start-session" ${!picked.length ? 'disabled' : ''}>▶ Start ${pf.totalMin}-minute session${blocks.length ? ` · ${blocks.length} blocks` : ''}</button>
     <p class="muted" style="text-align:center;margin-top:10px">Short and dense beats long and mushy — the forgetting between sessions is where the learning happens.</p>
   `;
 
+  // Picking. The ⋯ is checked first: it lives inside the row, and without this
+  // tapping it would toggle the selection on the way to opening the editor.
   $$('[data-pick]', view).forEach((el) =>
-    el.addEventListener('click', () => {
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('[data-editpiece]')) return;
       const id = +el.dataset.pick;
       const i = state.setupSel.indexOf(id);
-      if (i !== -1) state.setupSel.splice(i, 1);
-      else if (state.setupSel.length < 3) state.setupSel.push(id);
-      else return toast('Max 3 pieces — keep it dense');
+      if (i !== -1) state.setupSel.splice(i, 1); else state.setupSel.push(id);
       renderPractice();
     })
+  );
+  $$('[data-pickspot]', view).forEach((el) =>
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('[data-editspot]')) return;
+      const id = +el.dataset.pickspot;
+      const i = state.setupSpotSel.indexOf(id);
+      if (i !== -1) state.setupSpotSel.splice(i, 1); else state.setupSpotSel.push(id);
+      renderPractice();
+    })
+  );
+
+  // Editing in place — the Library's own sheets, told to come back here when done.
+  $$('[data-editpiece]', view).forEach((b) =>
+    b.addEventListener('click', (e) => { e.stopPropagation(); openPieceSheet(+b.dataset.editpiece, data, renderPractice); })
+  );
+  $$('[data-editspot]', view).forEach((b) =>
+    b.addEventListener('click', (e) => { e.stopPropagation(); openSpotSheet(+b.dataset.editspot, data, null, renderPractice); })
+  );
+  $('#add-item').addEventListener('click', () => {
+    if (spotsMode) openSpotSheet(null, data, null, renderPractice);
+    else openPieceCreateSheet(renderPractice);
+  });
+
+  $$('.seg button', view).forEach((b) =>
+    b.addEventListener('click', () => { savePrefs({ ...pf, mode: b.dataset.mode }); renderPractice(); })
+  );
+  $$('[data-mins]', view).forEach((b) =>
+    b.addEventListener('click', () => { savePrefs({ ...pf, totalMin: +b.dataset.mins }); renderPractice(); })
   );
   $$('[data-step]', view).forEach((b) =>
     b.addEventListener('click', () => {
       const [key, d] = b.dataset.step.split(':');
-      const p = prefs();
-      p[key] = Math.max(key === 'rounds' ? 1 : 3, Math.min(key === 'rounds' ? 5 : 15, p[key] + Number(d)));
-      savePrefs(p);
+      savePrefs({ ...pf, [key]: pf[key] + Number(d) });   // prefs() clamps on the way back out
       renderPractice();
     })
   );
@@ -207,16 +359,13 @@ function renderPractice() {
 }
 
 function startSession() {
-  const pf = prefs();
-  const groups = new Map([[0, '🛠 Technique'], ...state.data.pieces.map((p) => [p.id, p.title])]);
-  const order = state.setupSel.map((id) => ({ pieceId: id, title: groups.get(id) || 'Piece' }));
-  const blocks = [];
-  for (let r = 0; r < pf.rounds; r++) blocks.push(...order.map((o) => ({ ...o })));
+  const blocks = buildBlocks();
+  if (!blocks.length) return toast('Pick something to practice first');
   practice.session = {
     blocks,
     idx: 0,
-    blockSecs: pf.blockMin * 60,
-    endsAt: Date.now() + pf.blockMin * 60 * 1000,
+    blockSecs: blocks[0].secs,
+    endsAt: Date.now() + blocks[0].secs * 1000,
     pausedLeft: null,
     startedAt: new Date().toISOString(),
     voiceLog: [],
@@ -242,6 +391,7 @@ function renderSessionScreen() {
         <button class="btn small danger" id="end-session">End</button>
       </div>
       <div class="session-piece">${esc(block.title)}</div>
+      ${block.sub ? `<div class="session-sub">${esc(block.sub)}</div>` : ''}
       <div class="session-timer ${s.pausedLeft ? 'paused' : ''}" id="session-timer">--:--</div>
       <div class="progressbar"><div id="session-bar" style="width:0%"></div></div>
       <div class="session-controls">
@@ -252,7 +402,7 @@ function renderSessionScreen() {
       <p class="muted" style="text-align:center;margin:2px 0 6px" id="voice-status">${
         practice.listening ? 'Listening — just talk about what you\'re working on' : 'Tap the mic, then talk — "measures 30 to 34, that shift is really hard"'}</p>
       <div id="voice-feed"></div>
-      <h3 style="margin:14px 0 8px">Work on these <span class="muted">(hardest first)</span></h3>
+      <h3 style="margin:14px 0 8px">${(block.kind || 'piece') === 'spot' ? 'This spot' : 'Work on these <span class="muted">(hardest first)</span>'}</h3>
       <div id="block-spots"></div>
     </div>`;
 
@@ -277,6 +427,7 @@ function sessionSpotHtml(sp) {
         ${sp.description ? `<div class="desc">${esc(sp.description)}</div>` : ''}
       </div>
       <span class="status-pill ${esc(sp.status)}">${esc(sp.status)}</span>
+      <button class="pick-dots" data-editspot="${sp.id}" title="Edit this spot" aria-label="Edit this spot">⋯</button>
     </div>
     ${rated ? '' : `<div class="rate-row">${[0, 1, 2, 3].map((r) => `<button class="rate-btn r${r}" data-rate="${r}" data-spot="${sp.id}">${RATING_LABELS[r]}</button>`).join('')}</div>`}
   </div>`;
@@ -286,9 +437,24 @@ function refreshBlockSpots() {
   const s = practice.session;
   const holder = $('#block-spots');
   if (!holder || !s) return;
-  const spots = Scheduler.spotsForPiece(s.blocks[s.idx].pieceId);
-  holder.innerHTML = spots.length ? spots.map((sp) => sessionSpotHtml(sp)).join('')
-    : '<p class="muted">No spots for this piece yet — say one into the mic and it\'ll appear here.</p>';
+  const block = s.blocks[s.idx];
+  const data = refreshState();
+
+  let spots;
+  let empty;
+  if ((block.kind || 'piece') === 'spot') {
+    // A spot block is about exactly one spot. It can still go missing mid-session if
+    // it was archived from the ⋯ editor, so say so rather than showing a blank block.
+    const one = data.spots.find((sp) => sp.id === block.spotId);
+    spots = one ? [one] : [];
+    empty = '<p class="muted">This spot was removed from your library. Skip ahead when you\'re ready.</p>';
+  } else {
+    spots = Scheduler.spotsForPiece(block.pieceId);
+    empty = '<p class="muted">No spots for this piece yet — say one into the mic and it\'ll appear here.</p>';
+  }
+
+  holder.innerHTML = spots.length ? spots.map((sp) => sessionSpotHtml(sp)).join('') : empty;
+
   $$('#block-spots .rate-btn', view).forEach((b) =>
     b.addEventListener('click', () => {
       b.disabled = true;
@@ -300,6 +466,13 @@ function refreshBlockSpots() {
         refreshState();
         if (practice.session) refreshBlockSpots();
       } catch (e) { toast(e.message); b.disabled = false; }
+    })
+  );
+  // Fix a spot's wording mid-session without stopping the clock — the sheet is an
+  // overlay and the timer runs on its own interval, so the block keeps counting down.
+  $$('#block-spots [data-editspot]', view).forEach((b) =>
+    b.addEventListener('click', () => {
+      openSpotSheet(+b.dataset.editspot, data, null, () => { if (practice.session) refreshBlockSpots(); });
     })
   );
 }
@@ -331,6 +504,7 @@ function advanceBlock(manual) {
   const s = practice.session;
   if (s.idx + 1 >= s.blocks.length) return endSession(true);
   s.idx += 1;
+  s.blockSecs = s.blocks[s.idx].secs || s.blockSecs;   // each block carries its own length
   s.endsAt = Date.now() + s.blockSecs * 1000;
   s.pausedLeft = null;
   s.ratedThisBlock = [];
@@ -356,6 +530,7 @@ function endSession(completed) {
     if (completed) { beep(3); say('Session complete. Nice work.'); }
   }
   state.setupSel = [];
+  state.setupSpotSel = [];
   if (state.tab === 'practice') renderPractice();
   if (completed) toast('🎉 Session complete');
 }
@@ -437,6 +612,12 @@ async function handleVoiceNote(transcript) {
   try {
     const saved = JSON.parse(localStorage.getItem(PRACTICE_SESSION_KEY) || 'null');
     if (saved && (saved.pausedLeft || saved.endsAt > Date.now() - 10 * 60 * 1000)) {
+      // Sessions written before blocks carried a kind and their own length: fill both
+      // in so an in-flight session survives the update instead of throwing.
+      (saved.blocks || []).forEach((b) => {
+        if (!b.kind) b.kind = 'piece';
+        if (!Number.isFinite(b.secs)) b.secs = saved.blockSecs;
+      });
       practice.session = saved;
       if (!saved.pausedLeft && saved.endsAt < Date.now()) saved.pausedLeft = saved.blockSecs;
       refreshState();
@@ -740,24 +921,27 @@ function renderPieces(data) {
   }
   body.innerHTML = html;
 
-  $('#add-piece').addEventListener('click', () => {
-    openSheet(`<h3>Add piece</h3>
-      <label class="field"><span class="lab">Title</span><input type="text" id="np-title" placeholder="Elgar Cello Concerto, mvt 1"></label>
-      <label class="field"><span class="lab">Composer</span><input type="text" id="np-composer" placeholder="Edward Elgar"></label>
-      <button class="btn" id="np-save">Add piece</button>`);
-    $('#np-save').addEventListener('click', () => {
-      const title = $('#np-title').value.trim();
-      if (!title) return toast('Title is required');
-      DB.addPiece({ title, composer: $('#np-composer').value.trim() });
-      closeSheet(); toast('Piece added'); renderLibrary();
-    });
-  });
+  $('#add-piece').addEventListener('click', () => openPieceCreateSheet());
   $$('[data-piece]', body).forEach((el) =>
     el.addEventListener('click', () => openPieceSheet(+el.dataset.piece, data))
   );
 }
 
-function openPieceSheet(pieceId, data) {
+// Shared by the Library's ＋ Add piece and the Practice screen's ＋ Song.
+function openPieceCreateSheet(onDone = renderLibrary) {
+  openSheet(`<h3>Add piece</h3>
+    <label class="field"><span class="lab">Title</span><input type="text" id="np-title" placeholder="Elgar Cello Concerto, mvt 1"></label>
+    <label class="field"><span class="lab">Composer</span><input type="text" id="np-composer" placeholder="Edward Elgar"></label>
+    <button class="btn" id="np-save">Add piece</button>`);
+  $('#np-save').addEventListener('click', () => {
+    const title = $('#np-title').value.trim();
+    if (!title) return toast('Title is required');
+    DB.addPiece({ title, composer: $('#np-composer').value.trim() });
+    closeSheet(); toast('Piece added'); onDone();
+  });
+}
+
+function openPieceSheet(pieceId, data, onDone = renderLibrary) {
   const piece = pieceId ? data.pieces.find((p) => p.id === pieceId) : { id: 0, title: 'Technique & warm-ups' };
   const spots = data.spots.filter((s) => (s.piece_id ?? 0) === pieceId);
   openSheet(`
@@ -779,21 +963,21 @@ function openPieceSheet(pieceId, data) {
       </div>` : ''}
   `);
   $$('#sheet [data-spot]').forEach((el) =>
-    el.addEventListener('click', () => openSpotSheet(+el.dataset.spot, data))
+    el.addEventListener('click', () => openSpotSheet(+el.dataset.spot, data, null, onDone))
   );
-  $('#ps-add').addEventListener('click', () => openSpotSheet(null, data, pieceId));
+  $('#ps-add').addEventListener('click', () => openSpotSheet(null, data, pieceId, onDone));
   $('#ps-toggle')?.addEventListener('click', () => {
     DB.updatePiece(pieceId, { status: piece.status === 'active' ? 'paused' : 'active' });
-    closeSheet(); renderLibrary();
+    closeSheet(); onDone();
   });
   $('#ps-del')?.addEventListener('click', () => {
     if (!confirm(`Delete "${piece.title}" and all its spots?`)) return;
     DB.deletePiece(pieceId);
-    closeSheet(); toast('Piece deleted'); renderLibrary();
+    closeSheet(); toast('Piece deleted'); onDone();
   });
 }
 
-function openSpotSheet(spotId, data, defaultPieceId = null) {
+function openSpotSheet(spotId, data, defaultPieceId = null, onDone = renderLibrary) {
   const spot = spotId ? data.spots.find((s) => s.id === spotId) : null;
   const pieceOpts = ['<option value="">— Technique / no piece —</option>']
     .concat(data.pieces.map((p) => `<option value="${p.id}" ${((spot ? spot.piece_id : defaultPieceId) === p.id) ? 'selected' : ''}>${esc(p.title)}</option>`))
@@ -826,11 +1010,11 @@ function openSpotSheet(spotId, data, defaultPieceId = null) {
     } else {
       DB.addSpot(payload);
     }
-    closeSheet(); toast(spot ? 'Spot updated' : 'Spot added'); renderLibrary();
+    closeSheet(); toast(spot ? 'Spot updated' : 'Spot added'); onDone();
   });
   $('#sp-del')?.addEventListener('click', () => {
     DB.archiveSpot(spot.id);
-    closeSheet(); toast('Spot archived'); renderLibrary();
+    closeSheet(); toast('Spot archived'); onDone();
   });
 }
 

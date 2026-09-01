@@ -200,8 +200,11 @@ label.field .lab { display: block; font-size: .78rem; font-weight: 700; color: v
   transition: border-color .15s, background .15s;
 }
 .piece-pick.picked { border-color: var(--accent); background: var(--accent-soft); }
+.piece-pick .grow { flex: 1; min-width: 0; }   /* pushes the ⋯ to the row's right edge */
 .piece-pick .title { font-weight: 700; font-size: .95rem; }
-.piece-pick .sub { color: var(--text-dim); font-size: .8rem; margin-top: 2px; }
+.piece-pick .sub { color: var(--text-dim); font-size: .8rem; margin-top: 3px; }
+/* The status pill rides on the sub line so the spot's name keeps the full row width. */
+.piece-pick .sub .status-pill { margin-right: 4px; vertical-align: baseline; }
 .pick-num {
   width: 26px; height: 26px; border-radius: 50%; flex-shrink: 0;
   border: 1.5px solid var(--border);
@@ -209,6 +212,39 @@ label.field .lab { display: block; font-size: .78rem; font-weight: 700; color: v
   font-weight: 800; font-size: .85rem; color: var(--accent);
 }
 .piece-pick.picked .pick-num { border-color: var(--accent); background: var(--accent); color: #1a1206; }
+
+.big-num { font-size: 2rem; font-weight: 800; color: var(--accent); letter-spacing: -.02em; }
+
+/* Quick-pick session lengths — the common cases, one tap, no stepping. */
+.quick-mins { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.chip {
+  flex: 1 1 auto; min-width: 48px; padding: 8px 0;
+  border-radius: 11px; border: 1px solid var(--border);
+  background: var(--bg-elev2); color: var(--text-dim);
+  font-family: inherit; font-size: .9rem; font-weight: 700; cursor: pointer;
+}
+.chip.on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+
+/* ⋯ on a picker row or an in-session spot. Sized for a thumb and kept clear of the
+   row's own tap target, which toggles selection. */
+.pick-dots {
+  flex: 0 0 auto; width: 34px; height: 34px; padding: 0;
+  border-radius: 9px; border: 1px solid transparent;
+  background: transparent; color: var(--text-dim);
+  font-size: 1.15rem; line-height: 1; cursor: pointer;
+}
+.pick-dots:hover, .pick-dots:active { background: rgba(255,255,255,.08); color: var(--text); }
+
+/* What the numbers above add up to, stated plainly before you commit to them. */
+.setup-readout { text-align: center; }
+.setup-readout .ro-main { font-size: 1.25rem; font-weight: 800; margin-bottom: 4px; }
+.setup-readout .warn {
+  margin-top: 10px; padding: 9px 11px; border-radius: 11px;
+  background: rgba(242,99,95,.12); border: 1px solid rgba(242,99,95,.35);
+  color: var(--red); font-size: .82rem; line-height: 1.45;
+}
+
+.session-sub { text-align: center; color: var(--text-dim); font-size: .9rem; margin-top: 2px; }
 
 .stepper { display: flex; align-items: center; gap: 12px; }
 .stepper button {
