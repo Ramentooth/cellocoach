@@ -112,10 +112,13 @@ function listSpots() {
     .filter((sp) => !sp.archived)
     .map((sp) => ({ ...sp, piece_title: s.pieces.find((p) => p.id === sp.piece_id)?.title || '' }));
 }
-function addSpot({ piece_id = null, name, description = '', kind = 'spot' }) {
+function addSpot({ piece_id = null, name, description = '', kind = 'spot', methods = '' }) {
   const s = load();
   const sp = {
-    id: nextId('spot'), piece_id, name, description, kind, status: 'new',
+    // `methods` is how you practise this spot (slow with drones, dotted rhythms, …) as
+    // opposed to `description`, which is what's wrong with it. Older spots have no
+    // methods key at all; every reader coalesces to '' rather than migrating the save.
+    id: nextId('spot'), piece_id, name, description, methods, kind, status: 'new',
     ease: 1.8, interval_days: 0, due_date: today(), reps: 0, lapses: 0,
     last_rating: null, archived: 0, created_at: new Date().toISOString(),
   };

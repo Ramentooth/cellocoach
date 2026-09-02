@@ -65,7 +65,7 @@ $$('.tab').forEach((btn) =>
 );
 
 function render() {
-  if (state.tab !== 'practice') { stopListening(); stopTuner(); }
+  if (state.tab !== 'practice') { stopListening(); stopTuner(); stopMetronome(); }
   ({ practice: renderPractice, chat: renderChat, record: renderRecord, library: renderLibrary, settings: renderSettings }[state.tab])();
 }
 
@@ -79,6 +79,8 @@ const practice = {
   recog: null,
   listening: false,
   wakeLock: null,
+  openMethods: new Set(),   // spot ids whose "how to practise" box is unfolded
+  methodsTimers: {},        // spot id -> debounce handle for saving that box
 };
 
 const tuner = {
@@ -96,6 +98,154 @@ const tuner = {
 };
 
 const NOTE_NAMES = ['C', 'C\u266f', 'D', 'D\u266f', 'E', 'F', 'F\u266f', 'G', 'G\u266f', 'A', 'A\u266f', 'B'];
+
+/* METRONOME — sits beside the tuner and follows the same shape: a state object, a
+   markup function, a bind function, start/stop. It makes sound rather than listening,
+   so it needs no permission and can simply be armed.
+
+   Beats are scheduled AHEAD on the audio clock rather than fired from setInterval.
+   A timer callback drifts by whatever the main thread is busy with, which at 60bpm
+   is audible within a few bars — the audio clock doesn't. */
+const METRONOME_PREFS_KEY = 'cc-metronome';
+const metronome = {
+  context: null,
+  running: false,
+  bpm: 72,
+  beatsPerBar: 4,
+  nextNoteTime: 0,
+  beat: 0,
+  timer: null,
+};
+const MET_LOOKAHEAD_MS = 25;      // how often we top the schedule up
+const MET_SCHEDULE_AHEAD = 0.12;  // how far ahead we commit beats, in seconds
+
+function loadMetronomePrefs() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(METRONOME_PREFS_KEY) || '{}') || {};
+    metronome.bpm = clamp(Math.round(Number(raw.bpm) || 72), 30, 240);
+    metronome.beatsPerBar = clamp(Math.round(Number(raw.beatsPerBar) || 4), 1, 12);
+  } catch {}
+}
+function saveMetronomePrefs() {
+  try {
+    localStorage.setItem(METRONOME_PREFS_KEY, JSON.stringify({ bpm: metronome.bpm, beatsPerBar: metronome.beatsPerBar }));
+  } catch {}
+}
+
+function metronomeMarkup() {
+  return `
+    <section class="met-card" aria-labelledby="met-title">
+      <div class="met-head">
+        <div><div class="met-kicker">Tempo</div><h3 id="met-title">Metronome</h3></div>
+        <button class="btn small ${metronome.running ? 'danger' : 'secondary'}" id="met-toggle">${metronome.running ? 'Stop' : 'Start'}</button>
+      </div>
+      <div class="met-row">
+        <button class="met-step" data-bpm="-5" aria-label="Five slower">−5</button>
+        <button class="met-step" data-bpm="-1" aria-label="One slower">−</button>
+        <div class="met-bpm"><span id="met-bpm">${metronome.bpm}</span><small>bpm</small></div>
+        <button class="met-step" data-bpm="1" aria-label="One faster">+</button>
+        <button class="met-step" data-bpm="5" aria-label="Five faster">+5</button>
+      </div>
+      <div class="met-dots" id="met-dots" aria-hidden="true">
+        ${Array.from({ length: metronome.beatsPerBar }, (_, i) => `<span class="met-dot${i === 0 ? ' one' : ''}"></span>`).join('')}
+      </div>
+      <div class="met-row met-meter">
+        <span class="muted">Beats per bar</span>
+        <div class="stepper"><button data-bar="-1">−</button><b id="met-bar">${metronome.beatsPerBar}</b><button data-bar="1">＋</button></div>
+      </div>
+      <div class="met-presets">
+        ${[50, 60, 72, 88, 100, 120].map((b) => `<button class="chip ${b === metronome.bpm ? 'on' : ''}" data-preset="${b}">${b}</button>`).join('')}
+      </div>
+    </section>`;
+}
+
+function setBpm(next) {
+  metronome.bpm = clamp(Math.round(next), 30, 240);
+  saveMetronomePrefs();
+  const label = $('#met-bpm');
+  if (label) label.textContent = metronome.bpm;
+  $$('[data-preset]').forEach((b) => b.classList.toggle('on', +b.dataset.preset === metronome.bpm));
+}
+
+function setBeatsPerBar(next) {
+  metronome.beatsPerBar = clamp(Math.round(next), 1, 12);
+  metronome.beat = 0;
+  saveMetronomePrefs();
+  const label = $('#met-bar');
+  if (label) label.textContent = metronome.beatsPerBar;
+  const dots = $('#met-dots');
+  if (dots) {
+    dots.innerHTML = Array.from({ length: metronome.beatsPerBar },
+      (_, i) => `<span class="met-dot${i === 0 ? ' one' : ''}"></span>`).join('');
+  }
+}
+
+function bindMetronomeControls() {
+  $('#met-toggle')?.addEventListener('click', () => metronome.running ? stopMetronome() : startMetronome());
+  $$('[data-bpm]').forEach((b) => b.addEventListener('click', () => setBpm(metronome.bpm + Number(b.dataset.bpm))));
+  $$('[data-preset]').forEach((b) => b.addEventListener('click', () => setBpm(+b.dataset.preset)));
+  $$('[data-bar]').forEach((b) => b.addEventListener('click', () => setBeatsPerBar(metronome.beatsPerBar + Number(b.dataset.bar))));
+}
+
+// One click. The downbeat is higher and louder so you can hear where the bar starts.
+function clickAt(time, isDownbeat) {
+  const ctx = metronome.context;
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.connect(gain); gain.connect(ctx.destination);
+  osc.frequency.value = isDownbeat ? 1600 : 1000;
+  gain.gain.setValueAtTime(0.0001, time);
+  gain.gain.exponentialRampToValueAtTime(isDownbeat ? 0.5 : 0.32, time + 0.002);
+  gain.gain.exponentialRampToValueAtTime(0.0001, time + 0.05);
+  osc.start(time);
+  osc.stop(time + 0.06);
+}
+
+function metronomeScheduler() {
+  const ctx = metronome.context;
+  if (!ctx) return;
+  while (metronome.nextNoteTime < ctx.currentTime + MET_SCHEDULE_AHEAD) {
+    const isDownbeat = metronome.beat === 0;
+    clickAt(metronome.nextNoteTime, isDownbeat);
+    // Light the dot when this beat is actually due, not when it was scheduled.
+    const beatIndex = metronome.beat;
+    const delay = Math.max(0, (metronome.nextNoteTime - ctx.currentTime) * 1000);
+    setTimeout(() => {
+      if (!metronome.running) return;
+      $$('#met-dots .met-dot').forEach((d, i) => d.classList.toggle('lit', i === beatIndex));
+    }, delay);
+    metronome.nextNoteTime += 60 / metronome.bpm;
+    metronome.beat = (metronome.beat + 1) % metronome.beatsPerBar;
+  }
+}
+
+function startMetronome() {
+  if (metronome.running) return;
+  try {
+    metronome.context = metronome.context || new (window.AudioContext || window.webkitAudioContext)();
+    // iOS parks the context until a gesture resumes it; this call is inside a tap.
+    if (metronome.context.state === 'suspended') metronome.context.resume();
+  } catch {
+    toast('Audio is not available in this browser');
+    return;
+  }
+  metronome.running = true;
+  metronome.beat = 0;
+  metronome.nextNoteTime = metronome.context.currentTime + 0.06;
+  metronome.timer = setInterval(metronomeScheduler, MET_LOOKAHEAD_MS);
+  metronomeScheduler();
+  const btn = $('#met-toggle');
+  if (btn) { btn.textContent = 'Stop'; btn.classList.remove('secondary'); btn.classList.add('danger'); }
+}
+
+function stopMetronome() {
+  metronome.running = false;
+  clearInterval(metronome.timer);
+  metronome.timer = null;
+  $$('#met-dots .met-dot').forEach((d) => d.classList.remove('lit'));
+  const btn = $('#met-toggle');
+  if (btn) { btn.textContent = 'Start'; btn.classList.remove('danger'); btn.classList.add('secondary'); }
+}
 
 function tunerMarkup() {
   return `
@@ -580,6 +730,7 @@ function startSession() {
   };
   saveSession();
   grabWakeLock();
+  loadMetronomePrefs();
   beep(1);
   say(`Starting with ${blocks[0].title.replace(/^[^\w]*/, '')}`);
   renderSessionScreen();
@@ -591,6 +742,7 @@ function startSession() {
 function renderSessionScreen() {
   const s = practice.session;
   const block = s.blocks[s.idx];
+  const last = s.idx + 1 >= s.blocks.length;
 
   view.innerHTML = `
     <div class="session">
@@ -600,9 +752,15 @@ function renderSessionScreen() {
       </div>
       <div class="session-piece">${esc(block.title)}</div>
       ${block.sub ? `<div class="session-sub">${esc(block.sub)}</div>` : ''}
-      <div class="session-timer ${s.pausedLeft ? 'paused' : ''}" id="session-timer">--:--</div>
+      <div class="session-timer ${s.awaiting ? 'up' : ''}${s.pausedLeft ? ' paused' : ''}" id="session-timer">--:--</div>
       <div class="progressbar"><div id="session-bar" style="width:0%"></div></div>
+      ${s.awaiting ? `<div class="gate">
+        <div class="gate-title">Time — how did that go?</div>
+        <div class="gate-sub" id="gate-sub"></div>
+        <button class="btn" id="gate-next" ${blockGateCleared() ? '' : 'disabled'}>${last ? 'Finish session' : 'Next block'} ▸</button>
+      </div>` : ''}
       ${tunerMarkup()}
+      ${metronomeMarkup()}
       <div class="session-controls">
         <button class="ctrl-btn" id="pause-btn">${s.pausedLeft ? '▶' : '⏸'}</button>
         <button class="ctrl-btn mic ${practice.listening ? 'live' : ''}" id="mic-btn">🎙️</button>
@@ -619,16 +777,39 @@ function renderSessionScreen() {
   $('#end-session').addEventListener('click', () => endSession(false));
   $('#skip-btn').addEventListener('click', () => advanceBlock(true));
   $('#pause-btn').addEventListener('click', togglePause);
+  $('#gate-next')?.addEventListener('click', () => advanceBlock(true));
+  updateGateHint();
   $('#mic-btn').addEventListener('click', toggleListening);
   bindTunerControls();
+  bindMetronomeControls();
 
   clearInterval(practice.timer);
   practice.timer = setInterval(tickSession, 250);
   tickSession();
 }
 
-function sessionSpotHtml(sp) {
+// Keeps the gate's hint and its button in step with what's been rated, without
+// re-rendering the whole screen (which would tear down a half-typed methods box).
+function updateGateHint() {
+  const s = practice.session;
+  if (!s || !s.awaiting) return;
+  const cleared = blockGateCleared();
+  const sub = $('#gate-sub');
+  if (sub) {
+    sub.textContent = cleared
+      ? (s.ratedThisBlock.length ? `${s.ratedThisBlock.length} rated — you're good to move on.` : 'Nothing here to rate.')
+      : 'Rate at least one spot below to continue.';
+  }
+  const btn = $('#gate-next');
+  if (btn) btn.disabled = !cleared;
+}
+
+function sessionSpotHtml(sp, opts = {}) {
   const rated = practice.session.ratedThisBlock.includes(sp.id);
+  // Spot blocks are ABOUT this one spot, so its methods are open from the start.
+  // Everywhere else the card stays quiet until you ask for it with the ⋯.
+  const open = opts.open || practice.openMethods.has(sp.id);
+  const methods = sp.methods || '';
   return `
   <div class="plan-item ${rated ? 'done' : ''}">
     <div class="row">
@@ -637,8 +818,18 @@ function sessionSpotHtml(sp) {
         ${sp.description ? `<div class="desc">${esc(sp.description)}</div>` : ''}
       </div>
       <span class="status-pill ${esc(sp.status)}">${esc(sp.status)}</span>
-      <button class="pick-dots" data-editspot="${sp.id}" title="Edit this spot" aria-label="Edit this spot">⋯</button>
+      ${opts.fixedOpen ? '' : `<button class="pick-dots${open ? ' on' : ''}" data-methods="${sp.id}"
+        title="Practice methods" aria-label="Practice methods" aria-expanded="${open}">⋯</button>`}
     </div>
+    ${open ? `<div class="methods">
+      <div class="methods-lab">How to practise this</div>
+      <textarea class="methods-box" data-methodsfor="${sp.id}" rows="3"
+        placeholder="Slowly with a drone · dotted rhythms · bow alone, then hands together…">${esc(methods)}</textarea>
+      <div class="methods-foot">
+        <span class="muted" data-methodsaved="${sp.id}"></span>
+        <button class="btn small secondary" data-editspot="${sp.id}">Edit spot</button>
+      </div>
+    </div>` : (methods ? `<div class="methods-peek">📝 ${esc(methods.split('\n')[0].slice(0, 60))}${methods.length > 60 ? '…' : ''}</div>` : '')}
     ${rated ? '' : `<div class="rate-row">${[0, 1, 2, 3].map((r) => `<button class="rate-btn r${r}" data-rate="${r}" data-spot="${sp.id}">${RATING_LABELS[r]}</button>`).join('')}</div>`}
   </div>`;
 }
@@ -648,22 +839,17 @@ function refreshBlockSpots() {
   const holder = $('#block-spots');
   if (!holder || !s) return;
   const block = s.blocks[s.idx];
+  const isSpotBlock = (block.kind || 'piece') === 'spot';
   const data = refreshState();
 
-  let spots;
-  let empty;
-  if ((block.kind || 'piece') === 'spot') {
-    // A spot block is about exactly one spot. It can still go missing mid-session if
-    // it was archived from the ⋯ editor, so say so rather than showing a blank block.
-    const one = data.spots.find((sp) => sp.id === block.spotId);
-    spots = one ? [one] : [];
-    empty = '<p class="muted">This spot was removed from your library. Skip ahead when you\'re ready.</p>';
-  } else {
-    spots = Scheduler.spotsForPiece(block.pieceId);
-    empty = '<p class="muted">No spots for this piece yet — say one into the mic and it\'ll appear here.</p>';
-  }
+  const spots = currentBlockSpots();
+  const empty = isSpotBlock
+    ? '<p class="muted">This spot was removed from your library. Skip ahead when you\'re ready.</p>'
+    : '<p class="muted">No spots for this piece yet — say one into the mic and it\'ll appear here.</p>';
 
-  holder.innerHTML = spots.length ? spots.map((sp) => sessionSpotHtml(sp)).join('') : empty;
+  holder.innerHTML = spots.length
+    ? spots.map((sp) => sessionSpotHtml(sp, { open: isSpotBlock, fixedOpen: isSpotBlock })).join('')
+    : empty;
 
   $$('#block-spots .rate-btn', view).forEach((b) =>
     b.addEventListener('click', () => {
@@ -674,15 +860,39 @@ function refreshBlockSpots() {
         saveSession();
         toast(`${RATING_LABELS[+b.dataset.rate]} — back in ${r.interval_days} day${r.interval_days === 1 ? '' : 's'}`);
         refreshState();
-        if (practice.session) refreshBlockSpots();
+        if (practice.session) { refreshBlockSpots(); updateGateHint(); }
       } catch (e) { toast(e.message); b.disabled = false; }
     })
   );
-  // Fix a spot's wording mid-session without stopping the clock — the sheet is an
-  // overlay and the timer runs on its own interval, so the block keeps counting down.
+
+  // ⋯ unfolds the methods for this spot in place.
+  $$('#block-spots [data-methods]', view).forEach((b) =>
+    b.addEventListener('click', () => {
+      const id = +b.dataset.methods;
+      if (practice.openMethods.has(id)) practice.openMethods.delete(id);
+      else practice.openMethods.add(id);
+      refreshBlockSpots();
+    })
+  );
+
+  // Methods save as you type. Debounced so a save isn't written per keystroke, and
+  // the textarea is never re-rendered underneath you while it has focus.
+  $$('#block-spots [data-methodsfor]', view).forEach((box) =>
+    box.addEventListener('input', () => {
+      const id = +box.dataset.methodsfor;
+      clearTimeout(practice.methodsTimers[id]);
+      practice.methodsTimers[id] = setTimeout(() => {
+        DB.updateSpot(id, { methods: box.value });
+        refreshState();
+        const note = $(`[data-methodsaved="${id}"]`);
+        if (note) { note.textContent = 'Saved'; setTimeout(() => { if (note) note.textContent = ''; }, 1200); }
+      }, 500);
+    })
+  );
+
   $$('#block-spots [data-editspot]', view).forEach((b) =>
     b.addEventListener('click', () => {
-      openSpotSheet(+b.dataset.editspot, data, null, () => { if (practice.session) refreshBlockSpots(); });
+      openSpotSheet(+b.dataset.editspot, data, null, () => { if (practice.session) { refreshBlockSpots(); updateGateHint(); } });
     })
   );
 }
@@ -695,7 +905,39 @@ function tickSession() {
   if (el) el.textContent = fmtTime(left);
   const bar = $('#session-bar');
   if (bar) bar.style.width = `${100 - Math.round((left / s.blockSecs) * 100)}%`;
-  if (left <= 0 && !s.pausedLeft) advanceBlock(false);
+  if (left <= 0 && !s.pausedLeft && !s.awaiting) blockTimeUp();
+}
+
+// Time's up. The session HOLDS here rather than rolling on: rate what you worked on,
+// then move. Otherwise the next piece starts while you're still deciding how the last
+// one went, and the rating — the thing the whole schedule runs on — gets skipped.
+function blockTimeUp() {
+  const s = practice.session;
+  s.awaiting = true;
+  saveSession();
+  beep(3);
+  say('Time. How did that go?');
+  if (state.tab === 'practice') renderSessionScreen();
+}
+
+// A block is cleared once you've rated at least one of its spots. A block with nothing
+// to rate (a piece with no spots yet) can't be gated on a rating, so it just needs the tap.
+function blockGateCleared() {
+  const s = practice.session;
+  if (!s) return true;
+  return s.ratedThisBlock.length > 0 || currentBlockSpots().length === 0;
+}
+
+// The spots the CURRENT block is about — one for a spot block, the piece's list otherwise.
+function currentBlockSpots() {
+  const s = practice.session;
+  if (!s) return [];
+  const block = s.blocks[s.idx];
+  if ((block.kind || 'piece') === 'spot') {
+    const one = (state.data || refreshState()).spots.find((sp) => sp.id === block.spotId);
+    return one ? [one] : [];
+  }
+  return Scheduler.spotsForPiece(block.pieceId);
 }
 
 function togglePause() {
@@ -718,6 +960,7 @@ function advanceBlock(manual) {
   s.endsAt = Date.now() + s.blockSecs * 1000;
   s.pausedLeft = null;
   s.ratedThisBlock = [];
+  s.awaiting = false;
   saveSession();
   beep(manual ? 1 : 3);
   say(`Switch to ${s.blocks[s.idx].title.replace(/^[^\w]*/, '')}`);
@@ -729,6 +972,7 @@ function endSession(completed) {
   clearInterval(practice.timer);
   stopListening();
   stopTuner();
+  stopMetronome();
   try { practice.wakeLock?.release(); } catch {}
   practice.session = null;
   saveSession();
@@ -1204,6 +1448,7 @@ function openSpotSheet(spotId, data, defaultPieceId = null, onDone = renderLibra
       ${['new', 'learning', 'review', 'struggling', 'mastered'].map((s) => `<option ${spot.status === s ? 'selected' : ''}>${s}</option>`).join('')}
     </select></label>` : ''}
     <label class="field"><span class="lab">Notes</span><textarea id="sp-desc" placeholder="What to focus on…">${esc(spot?.description || '')}</textarea></label>
+    <label class="field"><span class="lab">How to practise this</span><textarea id="sp-methods" placeholder="Slowly with a drone · dotted rhythms · bow alone, then hands together…">${esc(spot?.methods || '')}</textarea></label>
     <button class="btn" id="sp-save">${spot ? 'Save' : 'Add spot'}</button>
     ${spot ? '<div class="spacer"></div><button class="btn danger" id="sp-del">Archive spot</button>' : ''}
   `);
@@ -1213,6 +1458,7 @@ function openSpotSheet(spotId, data, defaultPieceId = null, onDone = renderLibra
       piece_id: $('#sp-piece').value ? +$('#sp-piece').value : null,
       kind: $('#sp-kind').value,
       description: $('#sp-desc').value.trim(),
+      methods: $('#sp-methods').value.trim(),
     };
     if (!payload.name) return toast('Name is required');
     if (spot) {

@@ -424,3 +424,68 @@ label.field .lab { display: block; font-size: .78rem; font-weight: 700; color: v
 .empty { text-align: center; color: var(--text-dim); padding: 34px 20px; font-size: .92rem; line-height: 1.5; }
 .empty .big { font-size: 2.2rem; margin-bottom: 8px; }
 audio { width: 100%; margin-top: 8px; }
+
+
+/* ---------- practice methods on a spot card ---------- */
+/* Collapsed by default so a block of five spots stays scannable; a spot block opens
+   its own, since that block is about exactly that spot. */
+.pick-dots.on { background: var(--accent-soft); color: var(--accent); }
+.methods { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
+.methods-lab {
+  font-size: .72rem; font-weight: 700; color: var(--text-dim);
+  text-transform: uppercase; letter-spacing: .05em; margin-bottom: 6px;
+}
+.methods-box {
+  width: 100%; min-height: 68px; resize: vertical;
+  padding: 10px 12px; border-radius: 11px;
+  border: 1px solid var(--border); background: var(--bg-elev2); color: var(--text);
+  font-family: inherit; font-size: .9rem; line-height: 1.45;
+}
+.methods-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; }
+/* One-line hint that notes exist, so a collapsed card doesn't hide them entirely. */
+.methods-peek { margin-top: 8px; color: var(--text-dim); font-size: .82rem; }
+
+/* ---------- end-of-block gate ---------- */
+.gate {
+  margin: 12px 0 4px; padding: 14px;
+  border-radius: var(--radius);
+  border: 1px solid rgba(212,162,78,.45); background: var(--accent-soft);
+  text-align: center;
+}
+.gate-title { font-weight: 800; font-size: 1.05rem; margin-bottom: 2px; }
+.gate-sub { color: var(--text-dim); font-size: .85rem; margin-bottom: 12px; }
+.session-timer.up { color: var(--red); }
+
+/* ---------- metronome ---------- */
+.met-card {
+  background: var(--bg-elev); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 14px; margin: 12px 0;
+}
+.met-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.met-kicker {
+  font-size: .68rem; font-weight: 700; color: var(--text-dim);
+  text-transform: uppercase; letter-spacing: .06em;
+}
+.met-head h3 { font-size: 1rem; font-weight: 800; }
+.met-row { display: flex; align-items: center; justify-content: center; gap: 10px; }
+.met-step {
+  min-width: 44px; height: 40px; padding: 0 10px;
+  border-radius: 11px; border: 1px solid var(--border);
+  background: var(--bg-elev2); color: var(--text);
+  font-family: inherit; font-size: .9rem; font-weight: 700; cursor: pointer;
+}
+.met-step:active { transform: scale(.95); }
+.met-bpm { min-width: 104px; text-align: center; }
+.met-bpm span { font-size: 2.1rem; font-weight: 800; color: var(--accent); font-variant-numeric: tabular-nums; }
+.met-bpm small { display: block; font-size: .68rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: .06em; }
+.met-dots { display: flex; justify-content: center; gap: 8px; margin: 12px 0 4px; }
+.met-dot {
+  width: 12px; height: 12px; border-radius: 50%;
+  background: var(--bg-elev2); border: 1px solid var(--border);
+  transition: transform .06s, background .06s;
+}
+.met-dot.one { border-color: rgba(212,162,78,.5); }
+.met-dot.lit { background: var(--accent); border-color: var(--accent); transform: scale(1.35); }
+.met-dot.one.lit { background: var(--green); border-color: var(--green); }
+.met-meter { justify-content: space-between; margin-top: 12px; }
+.met-presets { display: flex; gap: 6px; margin-top: 12px; flex-wrap: wrap; }
