@@ -65,7 +65,7 @@ $$('.tab').forEach((btn) =>
 );
 
 function render() {
-  if (state.tab !== 'practice') stopListening();
+  if (state.tab !== 'practice') { stopListening(); stopTuner(); }
   ({ practice: renderPractice, chat: renderChat, record: renderRecord, library: renderLibrary, settings: renderSettings }[state.tab])();
 }
 
@@ -80,6 +80,213 @@ const practice = {
   listening: false,
   wakeLock: null,
 };
+
+const tuner = {
+  context: null,
+  analyser: null,
+  stream: null,
+  source: null,
+  frame: null,
+  buffer: null,
+  running: false,
+  starting: false,
+  status: 'Tuner is off',
+  lastPitch: null,
+  lastAnalysis: 0,
+};
+
+const NOTE_NAMES = ['C', 'C\u266f', 'D', 'D\u266f', 'E', 'F', 'F\u266f', 'G', 'G\u266f', 'A', 'A\u266f', 'B'];
+
+function tunerMarkup() {
+  return `
+    <section class="tuner-card" aria-labelledby="tuner-title">
+      <div class="tuner-head">
+        <div><div class="tuner-kicker">Live pitch</div><h3 id="tuner-title">Chromatic tuner</h3></div>
+        <button class="btn small ${tuner.running ? 'danger' : 'secondary'}" id="tuner-toggle">${tuner.running ? 'Stop' : 'Start'}</button>
+      </div>
+      <div class="tuner-readout" aria-live="polite">
+        <div class="tuner-direction" id="tuner-direction">${tuner.running ? 'Play a steady note' : esc(tuner.status)}</div>
+        <div class="tuner-note" id="tuner-note">\u2014<span></span></div>
+        <div class="tuner-frequency" id="tuner-frequency">\u2014 Hz</div>
+      </div>
+      <div class="tuner-gauge" id="tuner-gauge" aria-label="Pitch deviation from minus 50 to plus 50 cents">
+        <div class="tuner-zone"></div>
+        <div class="tuner-center"></div>
+        <div class="tuner-needle" id="tuner-needle"></div>
+        <span class="tuner-tick left">\u221250</span><span class="tuner-tick mid">0</span><span class="tuner-tick right">+50</span>
+      </div>
+      <div class="tuner-cents" id="tuner-cents">0 cents</div>
+      <p class="tuner-status" id="tuner-status">${esc(tuner.status)}</p>
+    </section>`;
+}
+
+function bindTunerControls() {
+  $('#tuner-toggle')?.addEventListener('click', () => tuner.running ? stopTuner() : startTuner());
+  if (tuner.running) updateTunerDisplay(tuner.lastPitch);
+}
+
+async function startTuner() {
+  if (tuner.running || tuner.starting) return;
+  if (!navigator.mediaDevices?.getUserMedia) {
+    setTunerStatus('Microphone tuning is not supported in this browser.', true);
+    return;
+  }
+  tuner.starting = true;
+  const startButton = $('#tuner-toggle');
+  if (startButton) { startButton.textContent = 'Starting\u2026'; startButton.disabled = true; }
+  setTunerStatus('Requesting microphone access\u2026');
+  let stream;
+  let context;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    });
+    if (!practice.session) { stream.getTracks().forEach((track) => track.stop()); return; }
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    context = new AudioCtx();
+    await context.resume();
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 4096;
+    analyser.smoothingTimeConstant = 0;
+    const source = context.createMediaStreamSource(stream);
+    source.connect(analyser);
+    Object.assign(tuner, {
+      context, analyser, stream, source, running: true,
+      buffer: new Float32Array(analyser.fftSize), status: 'Listening', lastPitch: null,
+    });
+    const btn = $('#tuner-toggle');
+    if (btn) { btn.textContent = 'Stop'; btn.disabled = false; btn.classList.add('danger'); btn.classList.remove('secondary'); }
+    setTunerStatus('Listening \u00b7 play one note at a time');
+    tuner.frame = requestAnimationFrame(tunerLoop);
+  } catch (error) {
+    stream?.getTracks().forEach((track) => track.stop());
+    try { context?.close(); } catch {}
+    const denied = error?.name === 'NotAllowedError' || error?.name === 'SecurityError';
+    setTunerStatus(denied
+      ? 'Microphone access was blocked. Allow it in browser settings, then tap Start.'
+      : 'Could not start the microphone. Check that it is available, then try again.', true);
+  } finally {
+    tuner.starting = false;
+    const btn = $('#tuner-toggle');
+    if (btn && !tuner.running) { btn.textContent = 'Start'; btn.disabled = false; }
+  }
+}
+
+function stopTuner() {
+  cancelAnimationFrame(tuner.frame);
+  tuner.stream?.getTracks().forEach((track) => track.stop());
+  try { tuner.source?.disconnect(); } catch {}
+  try { tuner.context?.close(); } catch {}
+  Object.assign(tuner, {
+    context: null, analyser: null, stream: null, source: null, frame: null,
+    buffer: null, running: false, starting: false, status: 'Tuner is off', lastPitch: null,
+  });
+  const btn = $('#tuner-toggle');
+  if (btn) { btn.textContent = 'Start'; btn.classList.remove('danger'); btn.classList.add('secondary'); }
+  updateTunerDisplay(null);
+  setTunerStatus('Tuner is off');
+}
+
+function setTunerStatus(message, isError = false) {
+  tuner.status = message;
+  const status = $('#tuner-status');
+  if (status) { status.textContent = message; status.classList.toggle('error', isError); }
+  const direction = $('#tuner-direction');
+  if (direction && !tuner.lastPitch) direction.textContent = message;
+}
+
+function tunerLoop() {
+  if (!tuner.running || !tuner.analyser) return;
+  const now = performance.now();
+  if (now - tuner.lastAnalysis >= 80) {
+    tuner.lastAnalysis = now;
+    tuner.analyser.getFloatTimeDomainData(tuner.buffer);
+    const frequency = detectPitch(tuner.buffer, tuner.context.sampleRate);
+    tuner.lastPitch = frequency ? pitchDetails(frequency) : null;
+    updateTunerDisplay(tuner.lastPitch);
+  }
+  tuner.frame = requestAnimationFrame(tunerLoop);
+}
+
+// Autocorrelation with parabolic interpolation. The RMS gate rejects room noise;
+// choosing the first strong correlation peak reduces octave jumps on bowed strings.
+function detectPitch(samples, sampleRate) {
+  const sampleCount = Math.min(samples.length, 2048);
+  let rms = 0;
+  for (let i = 0; i < sampleCount; i++) rms += samples[i] * samples[i];
+  rms = Math.sqrt(rms / sampleCount);
+  if (rms < 0.012) return null;
+
+  const minLag = Math.floor(sampleRate / 2000);
+  const maxLag = Math.min(Math.floor(sampleRate / 40), sampleCount >> 1);
+  const correlations = new Float32Array(maxLag + 1);
+  let bestLag = -1;
+  let best = 0;
+  for (let lag = minLag; lag <= maxLag; lag++) {
+    let sum = 0, normA = 0, normB = 0;
+    const limit = sampleCount - lag;
+    for (let i = 0; i < limit; i++) {
+      const a = samples[i], b = samples[i + lag];
+      sum += a * b; normA += a * a; normB += b * b;
+    }
+    const corr = sum / Math.sqrt(normA * normB || 1);
+    correlations[lag] = corr;
+    if (corr > best) { best = corr; bestLag = lag; }
+  }
+  if (best < 0.82 || bestLag < 0) return null;
+
+  // Prefer the earliest local peak near the global maximum (the fundamental period).
+  for (let lag = minLag + 1; lag < bestLag; lag++) {
+    if (correlations[lag] > best * 0.92 && correlations[lag] >= correlations[lag - 1] && correlations[lag] > correlations[lag + 1]) {
+      bestLag = lag; break;
+    }
+  }
+  const y1 = correlations[bestLag - 1] || correlations[bestLag];
+  const y2 = correlations[bestLag];
+  const y3 = correlations[bestLag + 1] || correlations[bestLag];
+  const denom = y1 - 2 * y2 + y3;
+  const refinedLag = bestLag + (denom ? 0.5 * (y1 - y3) / denom : 0);
+  const hz = sampleRate / refinedLag;
+  return hz >= 40 && hz <= 2000 ? hz : null;
+}
+
+function pitchDetails(frequency) {
+  const midi = Math.round(69 + 12 * Math.log2(frequency / 440));
+  const target = 440 * 2 ** ((midi - 69) / 12);
+  return {
+    frequency,
+    name: NOTE_NAMES[((midi % 12) + 12) % 12],
+    octave: Math.floor(midi / 12) - 1,
+    cents: 1200 * Math.log2(frequency / target),
+  };
+}
+
+function updateTunerDisplay(pitch) {
+  const note = $('#tuner-note');
+  const frequency = $('#tuner-frequency');
+  const cents = $('#tuner-cents');
+  const needle = $('#tuner-needle');
+  const direction = $('#tuner-direction');
+  const gauge = $('#tuner-gauge');
+  if (!note) return;
+  if (!pitch) {
+    note.innerHTML = '\u2014<span></span>';
+    frequency.textContent = '\u2014 Hz'; cents.textContent = '0 cents';
+    needle.style.transform = 'translateX(-50%) rotate(0deg)';
+    direction.textContent = tuner.running ? 'Play a steady note' : tuner.status;
+    gauge.classList.remove('in-tune');
+    return;
+  }
+  const rounded = Math.round(pitch.cents);
+  const clamped = clamp(pitch.cents, -50, 50);
+  note.innerHTML = `${pitch.name}<span>${pitch.octave}</span>`;
+  frequency.textContent = `${pitch.frequency.toFixed(1)} Hz`;
+  cents.textContent = `${rounded > 0 ? '+' : ''}${rounded} cent${Math.abs(rounded) === 1 ? '' : 's'}`;
+  needle.style.transform = `translateX(-50%) rotate(${clamped * 0.9}deg)`;
+  const inTune = Math.abs(pitch.cents) <= 5;
+  gauge.classList.toggle('in-tune', inTune);
+  direction.textContent = inTune ? 'In tune' : pitch.cents < 0 ? 'Tune up \u00b7 flat' : 'Tune down \u00b7 sharp';
+}
 
 const PRACTICE_PREFS_KEY = 'cc-practice-prefs';
 const PRACTICE_SESSION_KEY = 'cc-practice-session';
@@ -376,6 +583,7 @@ function startSession() {
   beep(1);
   say(`Starting with ${blocks[0].title.replace(/^[^\w]*/, '')}`);
   renderSessionScreen();
+  startTuner();
 }
 
 // ---------- session screen ----------
@@ -394,6 +602,7 @@ function renderSessionScreen() {
       ${block.sub ? `<div class="session-sub">${esc(block.sub)}</div>` : ''}
       <div class="session-timer ${s.pausedLeft ? 'paused' : ''}" id="session-timer">--:--</div>
       <div class="progressbar"><div id="session-bar" style="width:0%"></div></div>
+      ${tunerMarkup()}
       <div class="session-controls">
         <button class="ctrl-btn" id="pause-btn">${s.pausedLeft ? '▶' : '⏸'}</button>
         <button class="ctrl-btn mic ${practice.listening ? 'live' : ''}" id="mic-btn">🎙️</button>
@@ -411,6 +620,7 @@ function renderSessionScreen() {
   $('#skip-btn').addEventListener('click', () => advanceBlock(true));
   $('#pause-btn').addEventListener('click', togglePause);
   $('#mic-btn').addEventListener('click', toggleListening);
+  bindTunerControls();
 
   clearInterval(practice.timer);
   practice.timer = setInterval(tickSession, 250);
@@ -518,6 +728,7 @@ function endSession(completed) {
   const s = practice.session;
   clearInterval(practice.timer);
   stopListening();
+  stopTuner();
   try { practice.wakeLock?.release(); } catch {}
   practice.session = null;
   saveSession();

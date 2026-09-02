@@ -21,6 +21,7 @@ There is no backend. Pieces, spots, ratings, chat history, and lesson notes are 
 
 - **Practice tab** — pick up to 3 pieces (or let it pre-pick based on what's struggling/due), set minutes-per-block (default 7) and rounds, tap Start. It rotates through your pieces block by block with a big countdown, and **chimes + speaks the next piece name out loud** when it's time to switch — no need to look at the phone.
 - **Voice notes** — tap the mic once at the start of a block and just talk while you play: *"measures 30 to 34, that shift is really hard."* Speech recognition transcribes it, the AI turns it into a practice spot on whatever piece that block belongs to, rates its difficulty from how you described it, and speaks back a short confirmation. No typing.
+- **Live chromatic tuner** — starts with every practice session and shows the nearest note, frequency, cents sharp or flat, and a responsive tuning needle. You can stop or restart it at any time.
 - **Spaced repetition** — spots are rated Again / Hard / Good / Easy (modified SM-2, capped at 21 days since motor skills decay faster than flashcard facts). Within a block, spots for that piece show hardest-first — easy ones naturally fall out of rotation.
 - **Coach tab** — a chat that sees your pieces, spots, due dates, and recent ratings, and can edit your library directly from conversation (add pieces/spots, rate/update spots) — shown as ✓ chips.
 - **Lessons** — paste a transcript or upload lesson audio (transcribed via Whisper), then extract the assignments your teacher gave as ready-to-add spots.
