@@ -95,9 +95,18 @@ const tuner = {
   status: 'Tuner is off',
   lastPitch: null,
   lastAnalysis: 0,
+  // Readings from roughly the last half second, so a held note shows how the note
+  // settled rather than the wobble as the bow came off the string.
+  recent: [],
+  held: null,        // { pitch, until } while the last note stays up after it stops
 };
 
 const NOTE_NAMES = ['C', 'C\u266f', 'D', 'D\u266f', 'E', 'F', 'F\u266f', 'G', 'G\u266f', 'A', 'A\u266f', 'B'];
+const TUNER_HOLD_MS = 2000;       // how long the last note stays on screen after it stops
+const TUNER_RECENT_MS = 500;      // how much of the end of a note the held reading summarises
+// The mic hears the metronome, and a click is loud and pitched enough to read as a
+// note (which would then be held). Skip analysis for this long after each click.
+const TUNER_CLICK_GUARD_MS = 250;
 
 /* METRONOME — sits beside the tuner and follows the same shape: a state object, a
    markup function, a bind function, start/stop. It makes sound rather than listening,
@@ -115,6 +124,8 @@ const metronome = {
   nextNoteTime: 0,
   beat: 0,
   timer: null,
+  noise: null,               // shared noise buffer for the click's attack
+  lastClickAt: -Infinity,    // performance.now() of the last click, so the tuner can ignore it
 };
 const MET_LOOKAHEAD_MS = 25;      // how often we top the schedule up
 const MET_SCHEDULE_AHEAD = 0.12;  // how far ahead we commit beats, in seconds
@@ -187,18 +198,50 @@ function bindMetronomeControls() {
   $$('[data-bar]').forEach((b) => b.addEventListener('click', () => setBeatsPerBar(metronome.beatsPerBar + Number(b.dataset.bar))));
 }
 
-// One click. The downbeat is higher and louder so you can hear where the bar starts.
+// One click, loud enough to hear over a cello. A square wave carries strong harmonics
+// in the 2-5 kHz range, where hearing is most sensitive and the cello is quietest, so
+// it cuts through where a sine tone gets buried; it also sits at full level for 20 ms
+// before decaying, since a longer click reads as louder. A short burst of noise on top
+// gives it a woodblock-like snap. The two layers together peak right at full scale.
+// The downbeat is higher and a touch louder so you can hear where the bar starts.
 function clickAt(time, isDownbeat) {
   const ctx = metronome.context;
+  const level = isDownbeat ? 1 : 0.85;
+
   const osc = ctx.createOscillator();
-  const gain = ctx.createGain();
-  osc.connect(gain); gain.connect(ctx.destination);
-  osc.frequency.value = isDownbeat ? 1600 : 1000;
-  gain.gain.setValueAtTime(0.0001, time);
-  gain.gain.exponentialRampToValueAtTime(isDownbeat ? 0.5 : 0.32, time + 0.002);
-  gain.gain.exponentialRampToValueAtTime(0.0001, time + 0.05);
+  const body = ctx.createGain();
+  osc.type = 'square';
+  osc.frequency.value = isDownbeat ? 1500 : 1000;
+  body.gain.setValueAtTime(0.0001, time);
+  body.gain.exponentialRampToValueAtTime(0.8 * level, time + 0.001);
+  body.gain.setValueAtTime(0.8 * level, time + 0.02);
+  body.gain.exponentialRampToValueAtTime(0.0001, time + 0.1);
+  osc.connect(body).connect(ctx.destination);
   osc.start(time);
-  osc.stop(time + 0.06);
+  osc.stop(time + 0.11);
+
+  const noise = ctx.createBufferSource();
+  const hiss = ctx.createBiquadFilter();
+  const snap = ctx.createGain();
+  noise.buffer = clickNoise(ctx);
+  hiss.type = 'highpass';
+  hiss.frequency.value = 2500;
+  snap.gain.setValueAtTime(0.2 * level, time);
+  snap.gain.exponentialRampToValueAtTime(0.0001, time + 0.025);
+  noise.connect(hiss).connect(snap).connect(ctx.destination);
+  noise.start(time);
+  noise.stop(time + 0.03);
+}
+
+// 30 ms of white noise, made once and reused for every click.
+function clickNoise(ctx) {
+  if (metronome.noise?.sampleRate !== ctx.sampleRate) {
+    const buf = ctx.createBuffer(1, Math.ceil(ctx.sampleRate * 0.03), ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+    metronome.noise = buf;
+  }
+  return metronome.noise;
 }
 
 function metronomeScheduler() {
@@ -212,6 +255,7 @@ function metronomeScheduler() {
     const delay = Math.max(0, (metronome.nextNoteTime - ctx.currentTime) * 1000);
     setTimeout(() => {
       if (!metronome.running) return;
+      metronome.lastClickAt = performance.now();
       $$('#met-dots .met-dot').forEach((d, i) => d.classList.toggle('lit', i === beatIndex));
     }, delay);
     metronome.nextNoteTime += 60 / metronome.bpm;
@@ -272,7 +316,7 @@ function tunerMarkup() {
 
 function bindTunerControls() {
   $('#tuner-toggle')?.addEventListener('click', () => tuner.running ? stopTuner() : startTuner());
-  if (tuner.running) updateTunerDisplay(tuner.lastPitch);
+  if (tuner.running) updateTunerDisplay(tuner.lastPitch, Boolean(tuner.held));
 }
 
 async function startTuner() {
@@ -302,7 +346,7 @@ async function startTuner() {
     source.connect(analyser);
     Object.assign(tuner, {
       context, analyser, stream, source, running: true,
-      buffer: new Float32Array(analyser.fftSize), status: 'Listening', lastPitch: null,
+      buffer: new Float32Array(analyser.fftSize), status: 'Listening', lastPitch: null, recent: [], held: null,
     });
     const btn = $('#tuner-toggle');
     if (btn) { btn.textContent = 'Stop'; btn.disabled = false; btn.classList.add('danger'); btn.classList.remove('secondary'); }
@@ -329,7 +373,7 @@ function stopTuner() {
   try { tuner.context?.close(); } catch {}
   Object.assign(tuner, {
     context: null, analyser: null, stream: null, source: null, frame: null,
-    buffer: null, running: false, starting: false, status: 'Tuner is off', lastPitch: null,
+    buffer: null, running: false, starting: false, status: 'Tuner is off', lastPitch: null, recent: [], held: null,
   });
   const btn = $('#tuner-toggle');
   if (btn) { btn.textContent = 'Start'; btn.classList.remove('danger'); btn.classList.add('secondary'); }
@@ -348,12 +392,29 @@ function setTunerStatus(message, isError = false) {
 function tunerLoop() {
   if (!tuner.running || !tuner.analyser) return;
   const now = performance.now();
-  if (now - tuner.lastAnalysis >= 80) {
+  const sinceClick = now - metronome.lastClickAt;
+  const clickHeard = metronome.running && sinceClick >= 0 && sinceClick < TUNER_CLICK_GUARD_MS;
+  if (now - tuner.lastAnalysis >= 80 && !clickHeard) {
     tuner.lastAnalysis = now;
     tuner.analyser.getFloatTimeDomainData(tuner.buffer);
     const frequency = detectPitch(tuner.buffer, tuner.context.sampleRate);
-    tuner.lastPitch = frequency ? pitchDetails(frequency) : null;
-    updateTunerDisplay(tuner.lastPitch);
+    if (frequency) {
+      const pitch = pitchDetails(frequency);
+      tuner.recent.push({ pitch, t: now });
+      while (now - tuner.recent[0].t > TUNER_RECENT_MS) tuner.recent.shift();
+      tuner.held = null;
+      tuner.lastPitch = pitch;
+      updateTunerDisplay(pitch);
+    } else {
+      // The note just stopped: freeze how it ended and keep it up for a moment.
+      if (!tuner.held && tuner.recent.length) {
+        tuner.held = { pitch: steadyPitch(tuner.recent), until: now + TUNER_HOLD_MS };
+        tuner.recent = [];
+      }
+      if (tuner.held && now >= tuner.held.until) tuner.held = null;
+      tuner.lastPitch = tuner.held?.pitch || null;
+      updateTunerDisplay(tuner.lastPitch, Boolean(tuner.held));
+    }
   }
   tuner.frame = requestAnimationFrame(tunerLoop);
 }
@@ -405,13 +466,24 @@ function pitchDetails(frequency) {
   const target = 440 * 2 ** ((midi - 69) / 12);
   return {
     frequency,
+    midi,
     name: NOTE_NAMES[((midi % 12) + 12) % 12],
     octave: Math.floor(midi / 12) - 1,
     cents: 1200 * Math.log2(frequency / target),
   };
 }
 
-function updateTunerDisplay(pitch) {
+// The note heard most in these readings, at its median tuning, so one stray octave
+// jump or the pitch sagging as the bow lifts doesn't decide what gets held.
+function steadyPitch(readings) {
+  const counts = new Map();
+  for (const { pitch } of readings) counts.set(pitch.midi, (counts.get(pitch.midi) || 0) + 1);
+  const midi = [...counts].reduce((a, b) => (b[1] > a[1] ? b : a))[0];
+  const same = readings.map((r) => r.pitch).filter((p) => p.midi === midi).sort((a, b) => a.cents - b.cents);
+  return same[same.length >> 1];
+}
+
+function updateTunerDisplay(pitch, held = false) {
   const note = $('#tuner-note');
   const frequency = $('#tuner-frequency');
   const cents = $('#tuner-cents');
@@ -419,6 +491,9 @@ function updateTunerDisplay(pitch) {
   const direction = $('#tuner-direction');
   const gauge = $('#tuner-gauge');
   if (!note) return;
+  const isHeld = Boolean(pitch && held);
+  $('.tuner-readout')?.classList.toggle('held', isHeld);
+  gauge.classList.toggle('held', isHeld);
   if (!pitch) {
     note.innerHTML = '\u2014<span></span>';
     frequency.textContent = '\u2014 Hz'; cents.textContent = '0 cents';
@@ -435,7 +510,9 @@ function updateTunerDisplay(pitch) {
   needle.style.transform = `translateX(-50%) rotate(${clamped * 0.9}deg)`;
   const inTune = Math.abs(pitch.cents) <= 5;
   gauge.classList.toggle('in-tune', inTune);
-  direction.textContent = inTune ? 'In tune' : pitch.cents < 0 ? 'Tune up \u00b7 flat' : 'Tune down \u00b7 sharp';
+  direction.textContent = held
+    ? `That note was ${inTune ? 'in tune' : pitch.cents < 0 ? 'flat' : 'sharp'}`
+    : inTune ? 'In tune' : pitch.cents < 0 ? 'Tune up \u00b7 flat' : 'Tune down \u00b7 sharp';
 }
 
 const PRACTICE_PREFS_KEY = 'cc-practice-prefs';

@@ -322,6 +322,9 @@ label.field .lab { display: block; font-size: .78rem; font-weight: 700; color: v
 .tuner-tick.mid { left: 50%; transform: translateX(-50%); }
 .tuner-tick.right { right: 0; }
 .tuner-cents { margin-top: 7px; text-align: center; font-size: .82rem; font-weight: 750; font-variant-numeric: tabular-nums; }
+/* The last note, held after it stops: still readable, but visibly not live. */
+.tuner-readout.held .tuner-note, .tuner-readout.held .tuner-frequency { opacity: .6; }
+.tuner-gauge.held .tuner-needle { opacity: .55; box-shadow: none; }
 .tuner-status { margin: 4px 0 0; color: var(--text-dim); font-size: .72rem; line-height: 1.35; text-align: center; }
 .tuner-status.error { color: var(--red); }
 
